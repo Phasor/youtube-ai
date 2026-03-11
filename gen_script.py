@@ -65,8 +65,9 @@ def read_brief(path: Path) -> str:
 def generate_script(brief: str, duration_minutes: int, clip_seconds: int) -> dict:
     """Returns {"seed_prompt": str, "scenes": list[dict]}"""
     target_scenes = duration_minutes * 60 // clip_seconds
+    word_limit    = max_words(clip_seconds)
 
-    log(f"Sending brief to Claude (target ~{target_scenes} scenes for {duration_minutes} min)...")
+    log(f"Sending brief to Claude (target ~{target_scenes} scenes for {duration_minutes} min, ≤{word_limit} words/scene)...")
 
     prompt = f"""You are a professional video scriptwriter. Based on the brief below, write a compelling YouTube video script.
 
@@ -85,7 +86,7 @@ Return a single JSON object with two keys:
 {{
   "index": <integer starting at 1>,
   "title": "<3-6 word scene title>",
-  "narration": "<voiceover text for this scene, ~20-30 words, punchy and engaging, written as spoken word>",
+  "narration": "<voiceover text — MUST be {word_limit} words or fewer. This is a hard limit: the voiceover must finish well before the {clip_seconds}s clip ends so audio never gets cut off. Be punchy and concise, written as spoken word.>",
   "visual_prompt": "<detailed prompt for Kling AI image-to-video. Describe: subject, action, camera movement, lighting, mood. Be cinematic. The visual style should be consistent with the seed_prompt art style.>"
 }}
 
@@ -180,12 +181,14 @@ def scenes_to_markdown(result: dict, brief: str, duration_minutes: int, clip_sec
 
 # ─── NARRATION LENGTH FIX ─────────────────────────────────────────────────────
 
-# ElevenLabs speaks at roughly 130 wpm. Leave a small buffer so the voice
-# doesn't feel rushed — target 120 wpm to give ~15% headroom.
-WORDS_PER_MINUTE = 120
+# ElevenLabs speaks at roughly 150 wpm. We target 80% of clip duration for
+# narration so there's a comfortable silence buffer at the end of each scene.
+SPEECH_WPM     = 150
+AUDIO_BUFFER   = 0.80   # use 80% of clip time for speech → 20% safety margin
 
 def max_words(clip_seconds: int) -> int:
-    return int(clip_seconds / 60 * WORDS_PER_MINUTE)
+    """Max narration words that fit in clip_seconds with the audio buffer."""
+    return int(clip_seconds * AUDIO_BUFFER / 60 * SPEECH_WPM)
 
 def fix_narration_lengths(scenes: list[dict], clip_seconds: int) -> list[dict]:
     """
@@ -207,7 +210,7 @@ def fix_narration_lengths(scenes: list[dict], clip_seconds: int) -> list[dict]:
         for i, s in enumerate(too_long)
     )
 
-    prompt = f"""Shorten the following video narrations so each fits within {limit} words ({clip_seconds} seconds of speech at 120 wpm).
+    prompt = f"""Shorten the following video narrations so each fits within {limit} words (must finish within {int(clip_seconds * AUDIO_BUFFER)}s of a {clip_seconds}s clip).
 
 Rules:
 - Keep the core meaning, tone, and punchy style
