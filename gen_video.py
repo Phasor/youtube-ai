@@ -260,12 +260,39 @@ def get_audio_duration(path: Path) -> float:
     ], capture_output=True, text=True, check=True)
     return float(result.stdout.strip())
 
-def pad_audio_to_duration(src: Path, dest: Path, target_seconds: float):
-    """Pad (or trim) audio to exactly target_seconds using ffmpeg apad filter."""
+def fit_audio_to_duration(src: Path, dest: Path, target_seconds: float):
+    """Fit audio to exactly target_seconds: speed up if too long, pad if too short.
+
+    If narration is longer than the clip, speed it up (up to 1.3x) so nothing
+    gets cut off.  If it's still over after max speedup, trim with a short
+    fade-out so it doesn't cut mid-word.  Short narration is silence-padded.
+    """
+    actual = get_audio_duration(src)
+
+    MAX_TEMPO = 1.3          # fastest we'll go before it sounds weird
+    FADE_OUT  = 0.15         # seconds of fade when we must hard-trim
+
+    filters = []
+
+    if actual > target_seconds:
+        tempo = min(actual / target_seconds, MAX_TEMPO)
+        filters.append(f"atempo={tempo:.4f}")
+
+        # After speedup, will the audio now fit?
+        sped_duration = actual / tempo
+        if sped_duration > target_seconds:
+            # Still too long — fade out the last bit so it doesn't clip mid-word
+            fade_start = target_seconds - FADE_OUT
+            filters.append(f"afade=t=out:st={fade_start:.3f}:d={FADE_OUT}")
+
+    # Pad with silence to fill any remaining gap
+    filters.append(f"apad=whole_dur={target_seconds}")
+
+    af = ",".join(filters)
     subprocess.run([
         "ffmpeg",
         "-i", str(src),
-        "-af", f"apad=pad_dur={target_seconds}",
+        "-af", af,
         "-t", str(target_seconds),
         str(dest), "-y", "-loglevel", "error",
     ], check=True)
@@ -307,11 +334,12 @@ def generate_voiceover(project: Project, voice_id: str, clip_duration: str):
         # Measure and report if narration is too long
         duration = get_audio_duration(raw_path)
         if duration > clip_secs:
-            log(f"  Scene {scene.index}: narration is {duration:.1f}s — longer than {clip_secs}s clip (will be cut)", "WARN")
+            tempo = min(duration / clip_secs, 1.3)
+            log(f"  Scene {scene.index}: narration is {duration:.1f}s vs {clip_secs}s clip → speeding up {tempo:.2f}x", "WARN")
         else:
             log(f"  Scene {scene.index}: {duration:.1f}s narration → padded to {clip_secs}s", "OK")
 
-        pad_audio_to_duration(raw_path, padded_path, clip_secs)
+        fit_audio_to_duration(raw_path, padded_path, clip_secs)
         scene_audio.append(padded_path)
 
     if not scene_audio:
@@ -355,6 +383,7 @@ def stitch_video(project: Project):
             "-i", project.voiceover_path,
             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
             "-movflags", "+faststart",
             str(out), "-y", "-loglevel", "error",
         ]
