@@ -297,56 +297,37 @@ def fit_audio_to_duration(src: Path, dest: Path, target_seconds: float):
         str(dest), "-y", "-loglevel", "error",
     ], check=True)
 
-def generate_voiceover(project: Project, voice_id: str, clip_duration: str):
-    if not ELEVENLABS_KEY:
-        log("No ELEVENLABS_KEY — skipping voiceover", "WARN")
-        return
+def generate_scene_audio(scene: Scene, voice_id: str, clip_secs: float) -> Path:
+    """Generate TTS audio for a single scene. Returns path to the padded file."""
+    raw_path    = AUDIO_DIR / f"scene_{scene.index:03d}_raw.mp3"
+    padded_path = AUDIO_DIR / f"scene_{scene.index:03d}.mp3"
 
-    clip_secs   = float(clip_duration)
-    done_scenes = [s for s in project.scenes if s.status == "done"]
-    scene_audio = []
+    r = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        headers={"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"},
+        json={
+            "text":           scene.narration,
+            "model_id":       "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.2},
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    raw_path.write_bytes(r.content)
 
-    log(f"Generating per-scene voiceover ({len(done_scenes)} scenes)...")
+    duration = get_audio_duration(raw_path)
+    if duration > clip_secs:
+        tempo = min(duration / clip_secs, 1.3)
+        log(f"  Scene {scene.index}: narration is {duration:.1f}s vs {clip_secs}s clip → speeding up {tempo:.2f}x", "WARN")
+    else:
+        log(f"  Scene {scene.index}: {duration:.1f}s narration → padded to {clip_secs}s", "OK")
 
-    for scene in done_scenes:
-        raw_path    = AUDIO_DIR / f"scene_{scene.index:03d}_raw.mp3"
-        padded_path = AUDIO_DIR / f"scene_{scene.index:03d}.mp3"
+    fit_audio_to_duration(raw_path, padded_path, clip_secs)
+    return padded_path
 
-        # Skip if already generated (resume support)
-        if padded_path.exists():
-            log(f"  Scene {scene.index}: audio ✓ (skipping)")
-            scene_audio.append(padded_path)
-            continue
 
-        r = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-            headers={"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"},
-            json={
-                "text":           scene.narration,
-                "model_id":       "eleven_multilingual_v2",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.2},
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        raw_path.write_bytes(r.content)
-
-        # Measure and report if narration is too long
-        duration = get_audio_duration(raw_path)
-        if duration > clip_secs:
-            tempo = min(duration / clip_secs, 1.3)
-            log(f"  Scene {scene.index}: narration is {duration:.1f}s vs {clip_secs}s clip → speeding up {tempo:.2f}x", "WARN")
-        else:
-            log(f"  Scene {scene.index}: {duration:.1f}s narration → padded to {clip_secs}s", "OK")
-
-        fit_audio_to_duration(raw_path, padded_path, clip_secs)
-        scene_audio.append(padded_path)
-
-    if not scene_audio:
-        log("No scene audio to concatenate", "WARN")
-        return
-
-    # Concatenate all padded clips into one voiceover track
+def concat_scene_audio(project: Project, scene_audio: list[Path], clip_secs: float):
+    """Concatenate per-scene audio files into one voiceover track."""
     concat_txt = AUDIO_DIR / "audio_concat.txt"
     concat_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_audio), encoding="utf-8")
 
@@ -361,6 +342,86 @@ def generate_voiceover(project: Project, voice_id: str, clip_duration: str):
     project.voiceover_path = str(vo_path)
     total_s = len(scene_audio) * clip_secs
     log(f"Voiceover complete — {len(scene_audio)} scenes, {total_s:.0f}s total", "OK")
+
+
+def generate_voiceover(project: Project, voice_id: str, clip_duration: str):
+    if not ELEVENLABS_KEY:
+        log("No ELEVENLABS_KEY — skipping voiceover", "WARN")
+        return
+
+    clip_secs   = float(clip_duration)
+    done_scenes = [s for s in project.scenes if s.status == "done"]
+    scene_audio = []
+
+    log(f"Generating per-scene voiceover ({len(done_scenes)} scenes)...")
+
+    for scene in done_scenes:
+        padded_path = AUDIO_DIR / f"scene_{scene.index:03d}.mp3"
+
+        # Skip if already generated (resume support)
+        if padded_path.exists():
+            log(f"  Scene {scene.index}: audio ✓ (skipping)")
+            scene_audio.append(padded_path)
+            continue
+
+        scene_audio.append(generate_scene_audio(scene, voice_id, clip_secs))
+
+    if not scene_audio:
+        log("No scene audio to concatenate", "WARN")
+        return
+
+    concat_scene_audio(project, scene_audio, clip_secs)
+
+
+# ─── PRE-STITCH AUDIO AUDIT ─────────────────────────────────────────────────
+
+def audit_audio(project: Project, clip_duration: str) -> list[dict]:
+    """Check every scene's raw TTS audio against clip duration.
+
+    Returns a list of problem scenes: [{"scene": Scene, "audio_secs": float, "clip_secs": float}]
+    """
+    clip_secs = float(clip_duration)
+    problems  = []
+
+    for scene in project.scenes:
+        if scene.status != "done":
+            continue
+        raw_path = AUDIO_DIR / f"scene_{scene.index:03d}_raw.mp3"
+        if not raw_path.exists():
+            continue
+        audio_secs = get_audio_duration(raw_path)
+        if audio_secs > clip_secs:
+            problems.append({
+                "scene":      scene,
+                "audio_secs": audio_secs,
+                "clip_secs":  clip_secs,
+            })
+
+    return problems
+
+
+def print_audio_audit(problems: list[dict]):
+    """Print a clear warning table of scenes where audio exceeds video."""
+    if not problems:
+        log("Audio audit: all scenes fit within clip duration ✓", "OK")
+        return
+
+    log(f"\n{'─' * 60}", "WARN")
+    log(f"AUDIO AUDIT: {len(problems)} scene(s) have audio longer than video", "WARN")
+    log(f"{'─' * 60}", "WARN")
+    for p in problems:
+        scene = p["scene"]
+        over  = p["audio_secs"] - p["clip_secs"]
+        log(f"  Scene {scene.index:3d} — \"{scene.title}\"", "WARN")
+        log(f"           audio: {p['audio_secs']:.1f}s  |  clip: {p['clip_secs']:.1f}s  |  over by {over:.1f}s", "WARN")
+        word_count = len(scene.narration.split())
+        log(f"           narration ({word_count}w): \"{scene.narration[:80]}{'…' if len(scene.narration) > 80 else ''}\"", "WARN")
+    log(f"{'─' * 60}", "WARN")
+    log("These scenes were sped up / trimmed to fit. To fix properly:", "WARN")
+    scene_list = ",".join(str(p["scene"].index) for p in problems)
+    log(f"  1. Edit narration in output/script.md for scene(s): {scene_list}", "WARN")
+    log(f"  2. Re-run:  python gen_video.py --fix-audio {scene_list}", "WARN")
+    log(f"{'─' * 60}\n", "WARN")
 
 # ─── PHASE 4: STITCH ──────────────────────────────────────────────────────────
 
@@ -408,10 +469,91 @@ def print_cost_estimate(model_key: str, n_scenes: int):
 
 # ─── MAIN PIPELINE ────────────────────────────────────────────────────────────
 
+def fix_audio_for_scenes(project: Project, scene_indices: list[int],
+                         voice_id: str, clip_duration: str):
+    """Re-read narration from script.md and regenerate audio for specific scenes.
+
+    Video clips are untouched — only the audio files and final voiceover track
+    are rebuilt.
+    """
+    if not ELEVENLABS_KEY:
+        log("ELEVENLABS_KEY not set — cannot regenerate audio", "ERR")
+        sys.exit(1)
+
+    clip_secs = float(clip_duration)
+
+    # Re-read narration from script.md so user edits are picked up
+    fresh = {s.index: s for s in parse_script_md()}
+    updated = 0
+    for scene in project.scenes:
+        if scene.index in scene_indices and scene.index in fresh:
+            old_narration = scene.narration
+            scene.narration = fresh[scene.index].narration
+            if old_narration != scene.narration:
+                updated += 1
+                log(f"  Scene {scene.index}: narration updated from script.md", "OK")
+
+    if updated == 0:
+        log("No narration changes detected in script.md — did you edit the scenes?", "WARN")
+
+    # Regenerate audio for the specified scenes
+    log(f"\nRegenerating audio for scene(s): {', '.join(str(i) for i in scene_indices)}")
+    for scene in project.scenes:
+        if scene.index not in scene_indices:
+            continue
+        if scene.status != "done":
+            log(f"  Scene {scene.index}: skipped (no video clip)", "WARN")
+            continue
+
+        # Delete old audio so it gets regenerated
+        for suffix in ["_raw.mp3", ".mp3"]:
+            old = AUDIO_DIR / f"scene_{scene.index:03d}{suffix}"
+            if old.exists():
+                old.unlink()
+
+        generate_scene_audio(scene, voice_id, clip_secs)
+
+    # Rebuild the full voiceover track from all per-scene audio
+    log("\nRebuilding full voiceover track...")
+    done_scenes = [s for s in project.scenes if s.status == "done"]
+    scene_audio = []
+    for scene in done_scenes:
+        padded_path = AUDIO_DIR / f"scene_{scene.index:03d}.mp3"
+        if padded_path.exists():
+            scene_audio.append(padded_path)
+        else:
+            log(f"  Scene {scene.index}: missing audio — skipping", "WARN")
+
+    if scene_audio:
+        concat_scene_audio(project, scene_audio, clip_secs)
+    save_state(project)
+
+
 def run(model_key: str, clip_duration: str, aspect_ratio: str, voice_id: str,
         seed_override: Optional[str], resume: bool, skip_voiceover: bool,
-        voiceover_only: bool = False):
+        voiceover_only: bool = False, fix_audio: Optional[list[int]] = None):
     ensure_dirs()
+
+    # ── --fix-audio mode: regenerate audio for specific scenes, then stitch ──
+    if fix_audio:
+        if not STATE_FILE.exists():
+            log("No state.json found — run a full gen_video.py first", "ERR")
+            sys.exit(1)
+        project = load_state()
+        log(f"Fix-audio mode: regenerating audio for scene(s) {', '.join(str(i) for i in fix_audio)}")
+        fix_audio_for_scenes(project, fix_audio, voice_id, clip_duration)
+
+        # Audit the fixed scenes
+        problems = audit_audio(project, clip_duration)
+        print_audio_audit(problems)
+
+        log(f"\nPhase 4 — Stitch")
+        stitch_video(project)
+        save_state(project)
+
+        if project.final_path:
+            log(f"Output: {project.final_path}", "OK")
+        return
 
     if not FAL_KEY and not voiceover_only:
         log("FAL_KEY not set in .env", "ERR")
@@ -524,6 +666,11 @@ def run(model_key: str, clip_duration: str, aspect_ratio: str, voice_id: str,
         generate_voiceover(project, voice_id, clip_duration)
         save_state(project)
 
+    # ── Pre-stitch audio audit ────────────────────────────────────────────────
+    if not skip_voiceover:
+        problems = audit_audio(project, clip_duration)
+        print_audio_audit(problems)
+
     # ── Phase 4: stitch ───────────────────────────────────────────────────────
     log(f"\nPhase 4 — Stitch")
     stitch_video(project)
@@ -553,7 +700,19 @@ def main():
                     help="Skip ElevenLabs voiceover step")
     ap.add_argument("--voiceover-only", action="store_true",
                     help="Skip clip generation — redo voiceover and stitch from existing clips")
+    ap.add_argument("--fix-audio", default=None, metavar="SCENES",
+                    help="Re-generate audio for specific scenes after editing script.md. "
+                         "Comma-separated scene numbers, e.g. --fix-audio 5,12,23")
     args = ap.parse_args()
+
+    # Parse --fix-audio scene list
+    fix_audio_scenes = None
+    if args.fix_audio:
+        try:
+            fix_audio_scenes = [int(x.strip()) for x in args.fix_audio.split(",")]
+        except ValueError:
+            log(f"Invalid --fix-audio value: '{args.fix_audio}' — use comma-separated numbers, e.g. 5,12,23", "ERR")
+            sys.exit(1)
 
     run(
         model_key      = args.model or cfg["model"],
@@ -564,6 +723,7 @@ def main():
         resume         = args.resume,
         skip_voiceover = args.no_voiceover,
         voiceover_only = args.voiceover_only,
+        fix_audio      = fix_audio_scenes,
     )
 
 
