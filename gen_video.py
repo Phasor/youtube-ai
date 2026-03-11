@@ -36,6 +36,7 @@ load_dotenv()
 
 FAL_KEY        = os.getenv("FAL_KEY", "")
 ELEVENLABS_KEY = os.getenv("ELEVENLABS_KEY", "")
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_KEY", "")
 
 os.environ["FAL_KEY"] = FAL_KEY
 
@@ -260,48 +261,57 @@ def get_audio_duration(path: Path) -> float:
     ], capture_output=True, text=True, check=True)
     return float(result.stdout.strip())
 
-def fit_audio_to_duration(src: Path, dest: Path, target_seconds: float):
-    """Fit audio to exactly target_seconds: speed up if too long, pad if too short.
-
-    If narration is longer than the clip, speed it up (up to 1.3x) so nothing
-    gets cut off.  If it's still over after max speedup, trim with a short
-    fade-out so it doesn't cut mid-word.  Short narration is silence-padded.
-    """
-    actual = get_audio_duration(src)
-
-    MAX_TEMPO = 1.3          # fastest we'll go before it sounds weird
-    FADE_OUT  = 0.15         # seconds of fade when we must hard-trim
-
-    filters = []
-
-    if actual > target_seconds:
-        tempo = min(actual / target_seconds, MAX_TEMPO)
-        filters.append(f"atempo={tempo:.4f}")
-
-        # After speedup, will the audio now fit?
-        sped_duration = actual / tempo
-        if sped_duration > target_seconds:
-            # Still too long — fade out the last bit so it doesn't clip mid-word
-            fade_start = target_seconds - FADE_OUT
-            filters.append(f"afade=t=out:st={fade_start:.3f}:d={FADE_OUT}")
-
-    # Pad with silence to fill any remaining gap
-    filters.append(f"apad=whole_dur={target_seconds}")
-
-    af = ",".join(filters)
+def pad_audio_to_duration(src: Path, dest: Path, target_seconds: float):
+    """Pad audio with silence to exactly target_seconds. Never speeds up or trims."""
     subprocess.run([
         "ffmpeg",
         "-i", str(src),
-        "-af", af,
+        "-af", f"apad=whole_dur={target_seconds}",
         "-t", str(target_seconds),
         str(dest), "-y", "-loglevel", "error",
     ], check=True)
 
-def generate_scene_audio(scene: Scene, voice_id: str, clip_secs: float) -> Path:
-    """Generate TTS audio for a single scene. Returns path to the padded file."""
-    raw_path    = AUDIO_DIR / f"scene_{scene.index:03d}_raw.mp3"
-    padded_path = AUDIO_DIR / f"scene_{scene.index:03d}.mp3"
 
+def shorten_narration(narration: str, target_seconds: float, clip_seconds: float) -> str:
+    """Ask Claude to shorten a narration so it fits within target_seconds of speech."""
+    if not ANTHROPIC_KEY:
+        log("ANTHROPIC_KEY not set — cannot auto-shorten narration", "ERR")
+        return narration
+
+    word_limit = int(target_seconds / 60 * 150)  # 150 wpm for ElevenLabs
+
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key":         ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        },
+        json={
+            "model":      "claude-sonnet-4-20250514",
+            "max_tokens": 500,
+            "messages":   [{"role": "user", "content":
+                f"Shorten this video narration so it can be spoken in under "
+                f"{target_seconds:.0f} seconds ({word_limit} words max at 150 wpm). "
+                f"The video clip is {clip_seconds:.0f}s — the narration must finish "
+                f"with time to spare.\n\n"
+                f"Rules:\n"
+                f"- Keep the core meaning, tone, and punchy spoken style\n"
+                f"- MUST be under {word_limit} words\n"
+                f"- Return ONLY the shortened narration text, nothing else\n\n"
+                f"Original narration:\n\"{narration}\""
+            }],
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    shortened = r.json()["content"][0]["text"].strip().strip('"')
+    return shortened
+
+MAX_REWRITE_ATTEMPTS = 3   # max times to shorten + re-record before giving up
+
+def tts_scene(scene: Scene, voice_id: str, raw_path: Path) -> float:
+    """Call ElevenLabs TTS for a scene. Returns duration in seconds."""
     r = requests.post(
         f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
         headers={"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"},
@@ -314,15 +324,42 @@ def generate_scene_audio(scene: Scene, voice_id: str, clip_secs: float) -> Path:
     )
     r.raise_for_status()
     raw_path.write_bytes(r.content)
+    return get_audio_duration(raw_path)
 
-    duration = get_audio_duration(raw_path)
+
+def generate_scene_audio(scene: Scene, voice_id: str, clip_secs: float) -> Path:
+    """Generate TTS audio for a single scene. If audio overruns the clip,
+    ask Claude to shorten the narration and re-record (up to 3 attempts).
+    Returns path to the padded file."""
+    raw_path    = AUDIO_DIR / f"scene_{scene.index:03d}_raw.mp3"
+    padded_path = AUDIO_DIR / f"scene_{scene.index:03d}.mp3"
+
+    # Target 80% of clip for speech — leaves a comfortable buffer
+    target_secs = clip_secs * 0.80
+
+    duration = tts_scene(scene, voice_id, raw_path)
+
+    attempt = 0
+    while duration > clip_secs and attempt < MAX_REWRITE_ATTEMPTS:
+        attempt += 1
+        old_words = len(scene.narration.split())
+        log(f"  Scene {scene.index}: audio {duration:.1f}s > {clip_secs}s clip — "
+            f"asking Claude to shorten (attempt {attempt}/{MAX_REWRITE_ATTEMPTS})", "WARN")
+
+        shortened = shorten_narration(scene.narration, target_secs, clip_secs)
+        new_words = len(shortened.split())
+        log(f"  Scene {scene.index}: {old_words}w → {new_words}w", "OK")
+
+        scene.narration = shortened
+        duration = tts_scene(scene, voice_id, raw_path)
+
     if duration > clip_secs:
-        tempo = min(duration / clip_secs, 1.3)
-        log(f"  Scene {scene.index}: narration is {duration:.1f}s vs {clip_secs}s clip → speeding up {tempo:.2f}x", "WARN")
+        log(f"  Scene {scene.index}: still {duration:.1f}s after {MAX_REWRITE_ATTEMPTS} rewrites — "
+            f"will be trimmed (fix manually with --fix-audio {scene.index})", "ERR")
     else:
         log(f"  Scene {scene.index}: {duration:.1f}s narration → padded to {clip_secs}s", "OK")
 
-    fit_audio_to_duration(raw_path, padded_path, clip_secs)
+    pad_audio_to_duration(raw_path, padded_path, clip_secs)
     return padded_path
 
 
@@ -401,14 +438,15 @@ def audit_audio(project: Project, clip_duration: str) -> list[dict]:
 
 
 def print_audio_audit(problems: list[dict]):
-    """Print a clear warning table of scenes where audio exceeds video."""
+    """Print a clear warning table of scenes where audio still exceeds video
+    after automatic rewriting."""
     if not problems:
         log("Audio audit: all scenes fit within clip duration ✓", "OK")
         return
 
-    log(f"\n{'─' * 60}", "WARN")
-    log(f"AUDIO AUDIT: {len(problems)} scene(s) have audio longer than video", "WARN")
-    log(f"{'─' * 60}", "WARN")
+    log(f"\n{'─' * 60}", "ERR")
+    log(f"AUDIO AUDIT: {len(problems)} scene(s) still overrun after auto-rewrite", "ERR")
+    log(f"{'─' * 60}", "ERR")
     for p in problems:
         scene = p["scene"]
         over  = p["audio_secs"] - p["clip_secs"]
@@ -416,12 +454,12 @@ def print_audio_audit(problems: list[dict]):
         log(f"           audio: {p['audio_secs']:.1f}s  |  clip: {p['clip_secs']:.1f}s  |  over by {over:.1f}s", "WARN")
         word_count = len(scene.narration.split())
         log(f"           narration ({word_count}w): \"{scene.narration[:80]}{'…' if len(scene.narration) > 80 else ''}\"", "WARN")
-    log(f"{'─' * 60}", "WARN")
-    log("These scenes were sped up / trimmed to fit. To fix properly:", "WARN")
+    log(f"{'─' * 60}", "ERR")
     scene_list = ",".join(str(p["scene"].index) for p in problems)
-    log(f"  1. Edit narration in output/script.md for scene(s): {scene_list}", "WARN")
-    log(f"  2. Re-run:  python gen_video.py --fix-audio {scene_list}", "WARN")
-    log(f"{'─' * 60}\n", "WARN")
+    log("Auto-rewrite couldn't fix these. To fix manually:", "ERR")
+    log(f"  1. Edit narration in output/script.md for scene(s): {scene_list}", "ERR")
+    log(f"  2. Re-run:  python gen_video.py --fix-audio {scene_list}", "ERR")
+    log(f"{'─' * 60}\n", "ERR")
 
 # ─── PHASE 4: STITCH ──────────────────────────────────────────────────────────
 
