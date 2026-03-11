@@ -179,42 +179,66 @@ def scenes_to_markdown(result: dict, brief: str, duration_minutes: int, clip_sec
 
     return "\n".join(lines)
 
-# ─── NARRATION LENGTH FIX ─────────────────────────────────────────────────────
+# ─── AUDIO DURATION ESTIMATION ────────────────────────────────────────────────
 
-# ElevenLabs speaks at roughly 150 wpm. We target 80% of clip duration for
-# narration so there's a comfortable silence buffer at the end of each scene.
+# ElevenLabs eleven_multilingual_v2 speaks at roughly 150 wpm for plain
+# narration.  We target 80% of the clip duration for speech so there's a
+# comfortable 20% silence buffer at the end of each scene.
 SPEECH_WPM     = 150
 AUDIO_BUFFER   = 0.80   # use 80% of clip time for speech → 20% safety margin
 
+def estimate_speech_duration(text: str) -> float:
+    """Estimate how long ElevenLabs will take to speak *text*, in seconds.
+
+    Uses word count / WPM as the base, then adds a small per-sentence pause
+    allowance (0.25s) since TTS inserts natural pauses at full stops, colons,
+    and em-dashes.
+    """
+    words     = len(text.split())
+    sentences = max(1, len([c for c in text if c in ".!?:;—"]))
+    base      = words / SPEECH_WPM * 60          # raw speaking time
+    pauses    = sentences * 0.25                  # TTS breath pauses
+    return base + pauses
+
+def max_narration_seconds(clip_seconds: int) -> float:
+    """Max seconds of speech that should fit in a clip (with buffer)."""
+    return clip_seconds * AUDIO_BUFFER
+
 def max_words(clip_seconds: int) -> int:
     """Max narration words that fit in clip_seconds with the audio buffer."""
-    return int(clip_seconds * AUDIO_BUFFER / 60 * SPEECH_WPM)
+    return int(max_narration_seconds(clip_seconds) / 60 * SPEECH_WPM)
 
 def fix_narration_lengths(scenes: list[dict], clip_seconds: int) -> list[dict]:
     """
-    Find narrations that are too long for their clip and shorten them with Claude.
-    Returns scenes list (modified in place, also returned for clarity).
+    Find narrations whose estimated speech duration exceeds the buffered clip
+    time and shorten them with Claude.
     """
-    limit     = max_words(clip_seconds)
-    too_long  = [s for s in scenes if len(s["narration"].split()) > limit]
+    budget   = max_narration_seconds(clip_seconds)
+    limit_w  = max_words(clip_seconds)
+
+    too_long = []
+    for s in scenes:
+        est = estimate_speech_duration(s["narration"])
+        if est > budget:
+            too_long.append((s, est))
 
     if not too_long:
-        log(f"All narrations within {limit}-word limit ({clip_seconds}s clips) ✓", "OK")
+        log(f"All narrations fit within {budget:.1f}s budget ({clip_seconds}s clips) ✓", "OK")
         return scenes
 
-    log(f"{len(too_long)} narration(s) exceed {limit} words — shortening with Claude...")
+    log(f"{len(too_long)} narration(s) exceed {budget:.1f}s budget — shortening with Claude...")
 
     # Build a single batch request to avoid multiple API calls
     items = "\n".join(
-        f'{i+1}. Scene {s["index"]} ({len(s["narration"].split())} words): "{s["narration"]}"'
-        for i, s in enumerate(too_long)
+        f'{i+1}. Scene {s["index"]} (est {est:.1f}s, {len(s["narration"].split())}w): "{s["narration"]}"'
+        for i, (s, est) in enumerate(too_long)
     )
 
-    prompt = f"""Shorten the following video narrations so each fits within {limit} words (must finish within {int(clip_seconds * AUDIO_BUFFER)}s of a {clip_seconds}s clip).
+    prompt = f"""Shorten the following video narrations so each fits within {budget:.0f}s of speech (≤{limit_w} words at {SPEECH_WPM} wpm). Each clip is {clip_seconds}s — narration must end with time to spare.
 
 Rules:
 - Keep the core meaning, tone, and punchy style
-- Each narration must be UNDER {limit} words
+- Each narration must be UNDER {limit_w} words
 - Return ONLY a JSON array of objects: [{{"index": <scene index>, "narration": "<shortened text>"}}]
 - No markdown, no explanation
 
@@ -248,10 +272,10 @@ Narrations to shorten:
 
     for scene in scenes:
         if scene["index"] in fixes:
-            old_words = len(scene["narration"].split())
+            old_est = estimate_speech_duration(scene["narration"])
             scene["narration"] = fixes[scene["index"]]
-            new_words = len(scene["narration"].split())
-            log(f"  Scene {scene['index']}: {old_words}w → {new_words}w", "OK")
+            new_est = estimate_speech_duration(scene["narration"])
+            log(f"  Scene {scene['index']}: {old_est:.1f}s → {new_est:.1f}s ({len(scene['narration'].split())}w)", "OK")
 
     return scenes
 
@@ -286,7 +310,10 @@ def main():
     result["scenes"] = fix_narration_lengths(result["scenes"], clip_seconds)
     scenes   = result["scenes"]
     actual_s = len(scenes) * clip_seconds
+    budget   = max_narration_seconds(clip_seconds)
+    longest  = max(estimate_speech_duration(s["narration"]) for s in scenes)
     log(f"Script ready: {len(scenes)} scenes = {actual_s // 60}m {actual_s % 60}s", "OK")
+    log(f"Audio budget: {budget:.1f}s per {clip_seconds}s clip  |  longest narration: {longest:.1f}s", "OK")
     if result.get("seed_prompt"):
         log("Seed frame prompt included", "OK")
 
