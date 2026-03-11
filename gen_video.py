@@ -41,12 +41,13 @@ ANTHROPIC_KEY  = os.getenv("ANTHROPIC_KEY", "")
 os.environ["FAL_KEY"] = FAL_KEY
 
 MODELS = {
-    "standard": "fal-ai/kling-video/v3/standard/image-to-video",  # ~$0.29/clip
-    "pro":      "fal-ai/kling-video/v3/pro/image-to-video",       # ~$0.58/clip
-    "budget":   "fal-ai/kling-video/v2.1/standard/image-to-video", # ~$0.28/clip (5s)
-    "wan":      "fal-ai/wan/v2.2/image-to-video",                  # ~$1.00/clip
+    "standard": "fal-ai/kling-video/v3/standard/image-to-video",  # $0.084/sec → ~$0.84/10s clip
+    "pro":      "fal-ai/kling-video/v3/pro/image-to-video",       # $0.112/sec → ~$1.12/10s clip
+    "budget":   "fal-ai/kling-video/v2.1/standard/image-to-video", # $0.056/sec → ~$0.56/10s clip
+    "wan":      "fal-ai/wan/v2.2/image-to-video",                  # $0.080/sec → ~$0.80/10s clip
 }
-COST_PER_CLIP = {"standard": 0.29, "pro": 0.58, "budget": 0.28, "wan": 1.00}
+# fal.ai pricing — per second of video generated (audio off)
+COST_PER_SEC = {"standard": 0.084, "pro": 0.112, "budget": 0.056, "wan": 0.08}
 
 IMAGE_MODEL = "fal-ai/flux/schnell"   # seed frame only — one call per video run
 IMAGE_SIZE_MAP = {
@@ -499,11 +500,12 @@ def stitch_video(project: Project):
 
 # ─── COST ESTIMATE ────────────────────────────────────────────────────────────
 
-def print_cost_estimate(model_key: str, n_scenes: int):
+def print_cost_estimate(model_key: str, n_scenes: int, clip_seconds: int):
     seed_cost  = 0.003  # one flux/schnell image
-    video_cost = COST_PER_CLIP.get(model_key, 0.29) * n_scenes
+    per_clip   = COST_PER_SEC.get(model_key, 0.084) * clip_seconds
+    video_cost = per_clip * n_scenes
     vo_cost    = 0.30 if ELEVENLABS_KEY else 0.0
-    log(f"Estimated cost: ${seed_cost:.3f} seed + ${video_cost:.2f} video + ${vo_cost:.2f} voiceover = ~${seed_cost + video_cost + vo_cost:.2f}")
+    log(f"Estimated cost: ${seed_cost:.3f} seed + ${video_cost:.2f} video ({n_scenes} × ${per_clip:.2f}/clip) + ${vo_cost:.2f} voiceover = ~${seed_cost + video_cost + vo_cost:.2f}")
 
 # ─── MAIN PIPELINE ────────────────────────────────────────────────────────────
 
@@ -632,7 +634,7 @@ def run(model_key: str, clip_duration: str, aspect_ratio: str, voice_id: str,
     if not voiceover_only:
         log(f"Model:   {model_endpoint}")
         log(f"Aspect:  {aspect_ratio}")
-        print_cost_estimate(model_key, n)
+        print_cost_estimate(model_key, n, int(clip_duration))
     print()
 
     if not voiceover_only:

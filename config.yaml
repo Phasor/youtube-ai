@@ -7,10 +7,10 @@ brief: brief.md          # path to your brief file
 duration: 2              # target video length in minutes
 
 # ── Video model ───────────────────────────────────────────────────────────────
-# standard  fal-ai/kling-video/v3/standard   ~$0.29/clip   best value
-# pro       fal-ai/kling-video/v3/pro        ~$0.58/clip   higher quality
-# budget    fal-ai/kling-video/v2.1/standard ~$0.28/clip   older, 5s clips
-# wan       fal-ai/wan/v2.2                  ~$1.00/clip   open source alt
+# standard  fal-ai/kling-video/v3/standard   $0.084/sec (~$0.84/10s clip)  best value
+# pro       fal-ai/kling-video/v3/pro        $0.112/sec (~$1.12/10s clip)  higher quality
+# budget    fal-ai/kling-video/v2.1/standard $0.056/sec (~$0.56/10s clip)  older model
+# wan       fal-ai/wan/v2.2                  $0.080/sec (~$0.80/10s clip)  open source alt
 
 model: standard
 
