@@ -6,9 +6,10 @@ Generates multiple image variations from scene 1's visual prompt so you can
 pick the best starting frame before committing to video generation.
 
 Usage:
-  python gen_keyframe.py                    # 4 variations, fast model
-  python gen_keyframe.py --count 8          # 8 variations
-  python gen_keyframe.py --model quality    # flux-pro for higher fidelity
+  python gen_keyframe.py                                          # 4 variations, fast model
+  python gen_keyframe.py --count 8                               # 8 variations
+  python gen_keyframe.py --model quality                         # flux-pro for higher fidelity
+  python gen_keyframe.py --model kontext --input-image char.jpg  # image-to-image via flux kontext
   python gen_keyframe.py --prompt "custom prompt override"
 
 Then pass your chosen image to gen_video.py:
@@ -33,6 +34,7 @@ os.environ["FAL_KEY"] = FAL_KEY
 IMAGE_MODELS = {
     "fast":    ("fal-ai/flux/schnell",    4,  "$0.003/image", {"enable_safety_checker": False}),
     "quality": ("fal-ai/flux-pro/v1.1",  28,  "$0.05/image",  {"safety_tolerance": "5"}),
+    "kontext": ("fal-ai/flux-pro/kontext", None, "$0.04/image", {"safety_tolerance": "5"}),
 }
 
 IMAGE_SIZE_MAP = {
@@ -102,36 +104,54 @@ def download_file(url: str, dest: Path):
 
 # ─── GENERATION ───────────────────────────────────────────────────────────────
 
-def generate_options(prompt: str, count: int, model_key: str, aspect_ratio: str) -> list[Path]:
+def upload_image(path: Path) -> str:
+    """Upload a local image to fal CDN and return its URL."""
+    log(f"Uploading input image: {path}")
+    with open(path, "rb") as f:
+        url = fal_client.upload(f.read(), content_type="image/jpeg")
+    log(f"Uploaded → {url}", "OK")
+    return url
+
+def generate_options(prompt: str, count: int, model_key: str, aspect_ratio: str, input_image: Path | None = None) -> list[Path]:
     model_id, steps, cost_label, extra_args = IMAGE_MODELS[model_key]
     size = IMAGE_SIZE_MAP.get(aspect_ratio, "landscape_16_9")
+
+    if model_key == "kontext" and not input_image:
+        log("--model kontext requires --input-image <path>", "ERR")
+        sys.exit(1)
 
     log(f"Model:   {model_id} ({cost_label})")
     log(f"Count:   {count} variations")
     log(f"Aspect:  {aspect_ratio}")
+    if input_image:
+        log(f"Input:   {input_image}")
     log(f"Prompt:  {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
     print()
+
+    image_url = upload_image(input_image) if input_image else None
 
     saved = []
 
     for i in range(1, count + 1):
         log(f"Generating option {i}/{count}...")
         try:
-            result = fal_client.subscribe(
-                model_id,
-                arguments={
-                    "prompt":              prompt,
-                    "image_size":          size,
-                    "num_inference_steps": steps,
-                    "num_images":          1,
-                    **extra_args,
-                },
-            )
+            arguments = {
+                "prompt":     prompt,
+                "image_size": size,
+                "num_images": 1,
+                **extra_args,
+            }
+            if steps:
+                arguments["num_inference_steps"] = steps
+            if image_url:
+                arguments["image_url"] = image_url
+
+            result = fal_client.subscribe(model_id, arguments=arguments)
             url  = result["images"][0]["url"]
             dest = KEYS_DIR / f"option_{i:02d}.jpg"
             download_file(url, dest)
             saved.append(dest)
-            log(f"  ✓ Saved → {dest}", "OK")
+            log(f"  Saved -> {dest}", "OK")
         except Exception as e:
             log(f"  Option {i} failed: {e}", "ERR")
 
@@ -149,20 +169,27 @@ def main():
     ap = argparse.ArgumentParser(description="Generate seed frame options for gen_video.py")
     ap.add_argument("--count",  type=int, default=4,
                     help="Number of image variations to generate (default: 4)")
-    ap.add_argument("--model",  choices=["fast", "quality"], default="fast",
-                    help="fast=flux/schnell (~$0.003) | quality=flux-pro (~$0.05) (default: fast)")
+    ap.add_argument("--model",  choices=["fast", "quality", "kontext"], default="fast",
+                    help="fast=flux/schnell (~$0.003) | quality=flux-pro (~$0.05) | kontext=flux-pro/kontext (~$0.04, requires --input-image) (default: fast)")
     ap.add_argument("--prompt", default=None,
-                    help="Override prompt (default: uses Scene 1 visual prompt from script.md)")
+                    help="Override prompt (default: uses Seed Frame Prompt from script.md)")
+    ap.add_argument("--input-image", default=None,
+                    help="Path to input image for kontext (image-to-image). Required when --model kontext.")
     args = ap.parse_args()
 
     aspect_ratio = load_aspect_ratio()
     prompt       = args.prompt or get_seed_prompt()
+    input_image  = Path(args.input_image) if args.input_image else None
+
+    if input_image and not input_image.exists():
+        log(f"Input image not found: {input_image}", "ERR")
+        sys.exit(1)
 
     log("─" * 50)
     log("Seed Frame Generator")
     log("─" * 50)
 
-    saved = generate_options(prompt, args.count, args.model, aspect_ratio)
+    saved = generate_options(prompt, args.count, args.model, aspect_ratio, input_image)
 
     if not saved:
         log("No images were generated successfully.", "ERR")
