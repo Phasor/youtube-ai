@@ -481,6 +481,7 @@ def stitch_video(project: Project):
     if project.voiceover_path and Path(project.voiceover_path).exists():
         cmd = base_cmd + [
             "-i", project.voiceover_path,
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-c:a", "aac", "-b:a", "192k",
             "-shortest",
